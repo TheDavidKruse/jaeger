@@ -17,6 +17,7 @@ package app
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/jaegertracing/jaeger/cmd/collector/app/handler"
+	"github.com/jaegertracing/jaeger/cmd/collector/app/processor"
 	zipkinSanitizer "github.com/jaegertracing/jaeger/cmd/collector/app/sanitizer/zipkin"
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/testutils"
@@ -34,19 +37,24 @@ import (
 	zc "github.com/jaegertracing/jaeger/thrift-gen/zipkincore"
 )
 
-var blackListedService = "zoidberg"
+var (
+	_ io.Closer = (*fakeSpanWriter)(nil)
+	_ io.Closer = (*spanProcessor)(nil)
+
+	blackListedService = "zoidberg"
+)
 
 func TestBySvcMetrics(t *testing.T) {
 	allowedService := "bender"
 
 	type TestCase struct {
-		format      SpanFormat
+		format      processor.SpanFormat
 		serviceName string
 		rootSpan    bool
 		debug       bool
 	}
 
-	spanFormat := [2]SpanFormat{ZipkinSpanFormat, JaegerSpanFormat}
+	spanFormat := [2]processor.SpanFormat{processor.ZipkinSpanFormat, processor.JaegerSpanFormat}
 	serviceNames := [2]string{allowedService, blackListedService}
 	rootSpanEnabled := [2]bool{true, false}
 	debugEnabled := [2]bool{true, false}
@@ -73,7 +81,7 @@ func TestBySvcMetrics(t *testing.T) {
 		logger := zap.NewNop()
 		serviceMetrics := mb.Namespace(metrics.NSOptions{Name: "service", Tags: nil})
 		hostMetrics := mb.Namespace(metrics.NSOptions{Name: "host", Tags: nil})
-		processor := newSpanProcessor(
+		sp := newSpanProcessor(
 			&fakeSpanWriter{},
 			Options.ServiceMetrics(serviceMetrics),
 			Options.HostMetrics(hostMetrics),
@@ -85,15 +93,15 @@ func TestBySvcMetrics(t *testing.T) {
 		)
 		var metricPrefix, format string
 		switch test.format {
-		case ZipkinSpanFormat:
+		case processor.ZipkinSpanFormat:
 			span := makeZipkinSpan(test.serviceName, test.rootSpan, test.debug)
-			zHandler := NewZipkinSpanHandler(logger, processor, zipkinSanitizer.NewParentIDSanitizer())
-			zHandler.SubmitZipkinBatch([]*zc.Span{span, span}, SubmitBatchOptions{})
+			zHandler := handler.NewZipkinSpanHandler(logger, sp, zipkinSanitizer.NewParentIDSanitizer())
+			zHandler.SubmitZipkinBatch([]*zc.Span{span, span}, handler.SubmitBatchOptions{})
 			metricPrefix = "service"
 			format = "zipkin"
-		case JaegerSpanFormat:
+		case processor.JaegerSpanFormat:
 			span, process := makeJaegerSpan(test.serviceName, test.rootSpan, test.debug)
-			jHandler := NewJaegerSpanHandler(logger, processor)
+			jHandler := handler.NewJaegerSpanHandler(logger, sp)
 			jHandler.SubmitBatches([]*jaeger.Batch{
 				{
 					Spans: []*jaeger.Span{
@@ -102,7 +110,7 @@ func TestBySvcMetrics(t *testing.T) {
 					},
 					Process: process,
 				},
-			}, SubmitBatchOptions{})
+			}, handler.SubmitBatchOptions{})
 			metricPrefix = "service"
 			format = "jaeger"
 		default:
@@ -162,6 +170,10 @@ func (n *fakeSpanWriter) WriteSpan(span *model.Span) error {
 	return n.err
 }
 
+func (n *fakeSpanWriter) Close() error {
+	return nil
+}
+
 func makeZipkinSpan(service string, rootSpan bool, debugEnabled bool) *zc.Span {
 	var parentID *int64
 	if !rootSpan {
@@ -207,7 +219,6 @@ func makeJaegerSpan(service string, rootSpan bool, debugEnabled bool) (*jaeger.S
 func TestSpanProcessor(t *testing.T) {
 	w := &fakeSpanWriter{}
 	p := NewSpanProcessor(w, Options.QueueSize(1)).(*spanProcessor)
-	defer p.Stop()
 
 	res, err := p.ProcessSpans([]*model.Span{
 		{
@@ -215,9 +226,10 @@ func TestSpanProcessor(t *testing.T) {
 				ServiceName: "x",
 			},
 		},
-	}, ProcessSpansOptions{SpanFormat: JaegerSpanFormat})
+	}, processor.SpansOptions{SpanFormat: processor.JaegerSpanFormat})
 	assert.NoError(t, err)
 	assert.Equal(t, []bool{true}, res)
+	assert.NoError(t, p.Close())
 }
 
 func TestSpanProcessorErrors(t *testing.T) {
@@ -239,11 +251,11 @@ func TestSpanProcessorErrors(t *testing.T) {
 				ServiceName: "x",
 			},
 		},
-	}, ProcessSpansOptions{SpanFormat: JaegerSpanFormat})
+	}, processor.SpansOptions{SpanFormat: processor.JaegerSpanFormat})
 	assert.NoError(t, err)
 	assert.Equal(t, []bool{true}, res)
 
-	p.Stop()
+	assert.NoError(t, p.Close())
 
 	assert.Equal(t, map[string]string{
 		"level": "error",
@@ -274,7 +286,7 @@ func TestSpanProcessorBusy(t *testing.T) {
 		Options.QueueSize(1),
 		Options.ReportBusy(true),
 	).(*spanProcessor)
-	defer p.Stop()
+	defer assert.NoError(t, p.Close())
 
 	// block the writer so that the first span is read from the queue and blocks the processor,
 	// and eiher the second or the third span is rejected since the queue capacity is just 1.
@@ -297,7 +309,7 @@ func TestSpanProcessorBusy(t *testing.T) {
 				ServiceName: "x",
 			},
 		},
-	}, ProcessSpansOptions{SpanFormat: JaegerSpanFormat})
+	}, processor.SpansOptions{SpanFormat: processor.JaegerSpanFormat})
 
 	assert.Error(t, err, "expcting busy error")
 	assert.Nil(t, res)
@@ -309,7 +321,7 @@ func TestSpanProcessorWithNilProcess(t *testing.T) {
 
 	w := &fakeSpanWriter{}
 	p := NewSpanProcessor(w, Options.ServiceMetrics(serviceMetrics)).(*spanProcessor)
-	defer p.Stop()
+	defer assert.NoError(t, p.Close())
 
 	p.saveSpan(&model.Span{})
 
@@ -327,7 +339,7 @@ func TestSpanProcessorWithCollectorTags(t *testing.T) {
 
 	w := &fakeSpanWriter{}
 	p := NewSpanProcessor(w, Options.CollectorTags(testCollectorTags)).(*spanProcessor)
-	defer p.Stop()
+	defer assert.NoError(t, p.Close())
 
 	span := &model.Span{
 		Process: model.NewProcess("unit-test-service", []model.KeyValue{}),
@@ -353,9 +365,8 @@ func TestSpanProcessorCountSpan(t *testing.T) {
 	m := mb.Namespace(metrics.NSOptions{})
 
 	w := &fakeSpanWriter{}
-	p := NewSpanProcessor(w, Options.HostMetrics(m), Options.DynQueueSizeWarmup(1000)).(*spanProcessor)
+	p := NewSpanProcessor(w, Options.HostMetrics(m), Options.DynQueueSizeMemory(1000)).(*spanProcessor)
 	p.background(10*time.Millisecond, p.updateGauges)
-	defer p.Stop()
 
 	p.processSpan(&model.Span{})
 	assert.NotEqual(t, uint64(0), p.bytesProcessed)
@@ -370,6 +381,7 @@ func TestSpanProcessorCountSpan(t *testing.T) {
 	}
 
 	assert.Fail(t, "gauge hasn't been updated within a reasonable amount of time")
+	assert.NoError(t, p.Close())
 }
 
 func TestUpdateDynQueueSize(t *testing.T) {

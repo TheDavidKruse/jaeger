@@ -23,6 +23,7 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
+	"github.com/jaegertracing/jaeger/cmd/collector/app/processor"
 	"github.com/jaegertracing/jaeger/cmd/collector/app/sanitizer"
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/pkg/queue"
@@ -36,18 +37,6 @@ const (
 	// if the new queue size isn't 20% bigger than the previous one, don't change
 	minRequiredChange = 1.2
 )
-
-// ProcessSpansOptions additional options passed to processor along with the spans.
-type ProcessSpansOptions struct {
-	SpanFormat       SpanFormat
-	InboundTransport InboundTransport
-}
-
-// SpanProcessor handles model spans
-type SpanProcessor interface {
-	// ProcessSpans processes model spans and return with either a list of true/false success or an error
-	ProcessSpans(mSpans []*model.Span, options ProcessSpansOptions) ([]bool, error)
-}
 
 type spanProcessor struct {
 	queue              *queue.BoundedQueue
@@ -78,7 +67,7 @@ type queueItem struct {
 func NewSpanProcessor(
 	spanWriter spanstore.Writer,
 	opts ...Option,
-) SpanProcessor {
+) processor.SpanProcessor {
 	sp := newSpanProcessor(spanWriter, opts...)
 
 	sp.queue.StartConsumers(sp.numWorkers, func(item interface{}) {
@@ -125,7 +114,7 @@ func newSpanProcessor(spanWriter spanstore.Writer, opts ...Option) *spanProcesso
 	}
 
 	processSpanFuncs := []ProcessSpan{options.preSave, sp.saveSpan}
-	if options.dynQueueSizeWarmup > 0 {
+	if options.dynQueueSizeMemory > 0 {
 		// add to processSpanFuncs
 		options.logger.Info("Dynamically adjusting the queue size at runtime.",
 			zap.Uint("memory-mib", options.dynQueueSizeMemory/1024/1024),
@@ -137,10 +126,11 @@ func newSpanProcessor(spanWriter spanstore.Writer, opts ...Option) *spanProcesso
 	return &sp
 }
 
-// Stop halts the span processor and all its go-routines.
-func (sp *spanProcessor) Stop() {
+func (sp *spanProcessor) Close() error {
 	close(sp.stopCh)
 	sp.queue.Stop()
+
+	return nil
 }
 
 func (sp *spanProcessor) saveSpan(span *model.Span) {
@@ -167,7 +157,7 @@ func (sp *spanProcessor) countSpan(span *model.Span) {
 	sp.spansProcessed.Inc()
 }
 
-func (sp *spanProcessor) ProcessSpans(mSpans []*model.Span, options ProcessSpansOptions) ([]bool, error) {
+func (sp *spanProcessor) ProcessSpans(mSpans []*model.Span, options processor.SpansOptions) ([]bool, error) {
 	sp.preProcessSpans(mSpans)
 	sp.metrics.BatchSize.Update(int64(len(mSpans)))
 	retMe := make([]bool, len(mSpans))
@@ -193,7 +183,7 @@ func (sp *spanProcessor) addCollectorTags(span *model.Span) {
 	}
 }
 
-func (sp *spanProcessor) enqueueSpan(span *model.Span, originalFormat SpanFormat, transport InboundTransport) bool {
+func (sp *spanProcessor) enqueueSpan(span *model.Span, originalFormat processor.SpanFormat, transport processor.InboundTransport) bool {
 	spanCounts := sp.metrics.GetCountsForFormat(originalFormat, transport)
 	spanCounts.ReceivedBySvc.ReportServiceNameForSpan(span)
 

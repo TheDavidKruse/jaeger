@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package builder
+package app
 
 import (
 	"testing"
@@ -50,10 +50,12 @@ func TestNewSpanHandlerBuilder(t *testing.T) {
 		MetricsFactory: metrics.NullFactory,
 	}
 
-	zipkin, jaeger, grpc := builder.BuildHandlers()
-	assert.NotNil(t, zipkin)
-	assert.NotNil(t, jaeger)
-	assert.NotNil(t, grpc)
+	spanProcessor := builder.BuildSpanProcessor()
+	spanHandlers := builder.BuildHandlers(spanProcessor)
+	assert.NotNil(t, spanHandlers.ZipkinSpansHandler)
+	assert.NotNil(t, spanHandlers.JaegerBatchesHandler)
+	assert.NotNil(t, spanHandlers.GRPCHandler)
+	assert.NotNil(t, spanProcessor)
 }
 
 func TestDefaultSpanFilter(t *testing.T) {

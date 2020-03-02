@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package app
+package handler
 
 import (
 	"context"
@@ -26,6 +26,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
+	"github.com/jaegertracing/jaeger/cmd/collector/app/processor"
 	"github.com/jaegertracing/jaeger/model"
 	"github.com/jaegertracing/jaeger/proto-gen/api_v2"
 )
@@ -36,7 +37,7 @@ type mockSpanProcessor struct {
 	spans         []*model.Span
 }
 
-func (p *mockSpanProcessor) ProcessSpans(spans []*model.Span, opts ProcessSpansOptions) ([]bool, error) {
+func (p *mockSpanProcessor) ProcessSpans(spans []*model.Span, opts processor.SpansOptions) ([]bool, error) {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	p.spans = append(p.spans, spans...)
@@ -54,6 +55,10 @@ func (p *mockSpanProcessor) reset() {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	p.spans = nil
+}
+
+func (p *mockSpanProcessor) Close() error {
+	return nil
 }
 
 func initializeGRPCTestServer(t *testing.T, beforeServe func(s *grpc.Server)) (*grpc.Server, net.Addr) {
